@@ -1,3 +1,6 @@
+import time
+import sys
+import tiktoken
 import math
 import torch
 import torch.nn as nn
@@ -35,10 +38,12 @@ class CausalSelfAttention(nn.Module):
                    self.n_head).transpose(1, 2)  # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         # re-assemble all head outputs side by side
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
@@ -99,19 +104,18 @@ class GPT(nn.Module):
         ))
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        
+
         # weight sharing scheme
         self.transformer.wte.weight = self.lm_head.weight
 
         # init params
         self.apply(self._init_weights)
 
-
     def _init_weights(self, module):
-        std= 0.02
+        std = 0.02
         if isinstance(module, nn.Linear):
             if hasattr(module, 'GPT_SCALE_INIT'):
-                std *= (2*self.config.n_layer) ** -0.5
+                std *= (2*self.config.n_layers) ** -0.5
             # in gpt2, the bias of Linear module is initialized to 0
             torch.nn.init.normal_(module.weight, std=std)
             if module.bias is not None:
@@ -188,7 +192,7 @@ class GPT(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-import tiktoken
+
 
 class DataLoaderLite:
     def __init__(self, B, T):
@@ -215,7 +219,7 @@ class DataLoaderLite:
 
         if self.current_position + (B*T+1) > len(self.tokens):
             self.current_position = 0
-        
+
         return x, y
 
 
@@ -226,23 +230,34 @@ elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     device = 'mps'
 print(f'using device: {device}')
 
-train_loader = DataLoaderLite(B=4, T=32)
-# model = GPT.from_pretrained('gpt2')
-model = GPT(config=GPTConfig())
+train_loader = DataLoaderLite(B=8, T=128)
+# set tf32
+torch.set_float32_matmul_precision('high')
+
+model = GPT(config=GPTConfig(vocab_size=50304))
 model.to(device)
-# logits, loss = model(x, y)
+# model = torch.compile(model)
+
 optim = AdamW(model.parameters(), lr=3e-4)
 for i in range(50):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
 
     optim.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
+
     loss.backward()
     optim.step()
-    print(f'step {i}, loss: {loss.item()}')
+    torch.cuda.synchronize()  # only needed with CUDA
+    t1 = time.time()
+    dt = (t1 - t0) * 1000  # ms
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1-t0)
+    print(
+        f'step {i}, loss: {loss.item()}, dt: {dt:.2f} ms, tok/ms: {tokens_per_sec:.2f}')
 
-import sys; sys.exit(0)
+sys.exit(0)
 
 # prefix tokens
 enc = tiktoken.get_encoding('gpt2')
